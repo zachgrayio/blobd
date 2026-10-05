@@ -1,6 +1,7 @@
 use ahash::HashMap;
 use ahash::HashMapExt;
 use benchmark_types::BenchmarkResults;
+use benchmark_types::CachePressureResult;
 use benchmark_types::Config;
 use benchmark_types::FinalSystemMetrics;
 use benchmark_types::LatencyStats;
@@ -11,6 +12,12 @@ use chrono::Utc;
 use clap::Parser;
 use futures::stream::iter;
 use futures::StreamExt;
+use libblobd_direct::op::commit_object::OpCommitObjectInput;
+use libblobd_direct::op::create_object::OpCreateObjectInput;
+use libblobd_direct::op::read_object::OpReadObjectInput;
+use libblobd_direct::op::write_object::OpWriteObjectInput;
+use libblobd_direct::op::OpError;
+use libblobd_direct::Blobd;
 use off64::int::create_u64_be;
 use off64::usz;
 use procfs::Current;
@@ -99,6 +106,26 @@ struct Cli {
   /// Skips deleting objects.
   #[arg(long)]
   skip_deletion: bool,
+
+  /// Enable CLOCK eviction for direct-store benchmarks.
+  #[arg(long)]
+  cache_eviction: bool,
+
+  /// Run a direct-store mixed-size workload that exceeds partition capacity.
+  #[arg(long, requires = "cache_eviction")]
+  cache_pressure: bool,
+
+  /// Override the first configured direct partition's device path.
+  #[arg(long)]
+  device: Option<PathBuf>,
+
+  /// Override the first configured direct partition's length in bytes.
+  #[arg(long)]
+  partition_len: Option<u64>,
+
+  /// Skip clearing kernel page cache (useful in restricted containers).
+  #[arg(long)]
+  skip_cache_drop: bool,
 }
 
 fn run_script(script_path: &Path) {
@@ -138,6 +165,109 @@ fn drop_caches() {
 fn cleanup_memory() {
   malloc_trim();
   drop_caches();
+}
+
+async fn run_cache_pressure(
+  blobd: &Blobd,
+  objects: u64,
+  object_size: u64,
+  spage_size: u64,
+) -> CachePressureResult {
+  let started = Instant::now();
+  let mut read_hits = 0;
+  let mut read_misses = 0;
+  for index in 0..objects {
+    let size = (object_size >> (index % 3)).max(spage_size);
+    let key = create_u64_be(index).to_vec();
+    let created = blobd
+      .create_object(OpCreateObjectInput { key, size })
+      .await
+      .unwrap();
+    let data = vec![index as u8; usz!(size)];
+    blobd
+      .write_object(OpWriteObjectInput {
+        incomplete_token: created.token,
+        offset: 0,
+        data_len: size,
+        data_stream: futures::stream::iter([Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+          data,
+        )]),
+      })
+      .await
+      .unwrap();
+    blobd
+      .commit_object(OpCommitObjectInput {
+        incomplete_token: created.token,
+        if_not_exists: false,
+      })
+      .await
+      .unwrap();
+    if index % 4 == 0 {
+      let previous = index / 2;
+      check_cache_read(
+        blobd,
+        previous,
+        object_size,
+        spage_size,
+        &mut read_hits,
+        &mut read_misses,
+      )
+      .await;
+    }
+  }
+  for index in 0..objects {
+    check_cache_read(
+      blobd,
+      index,
+      object_size,
+      spage_size,
+      &mut read_hits,
+      &mut read_misses,
+    )
+    .await;
+  }
+  CachePressureResult {
+    exec_secs: started.elapsed().as_secs_f64(),
+    writes: objects,
+    read_hits,
+    read_misses,
+    evictions: blobd.metrics().evicted_object_count(),
+  }
+}
+
+async fn check_cache_read(
+  blobd: &Blobd,
+  index: u64,
+  object_size: u64,
+  spage_size: u64,
+  hits: &mut u64,
+  misses: &mut u64,
+) {
+  let size = (object_size >> (index % 3)).max(spage_size);
+  match blobd
+    .read_object(OpReadObjectInput {
+      key: create_u64_be(index).to_vec(),
+      id: None,
+      start: 0,
+      end: None,
+      stream_buffer_size: spage_size,
+    })
+    .await
+  {
+    Ok(output) => {
+      let mut stream = output.data_stream;
+      let mut read_size = 0;
+      while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        assert!(chunk.iter().all(|byte| *byte == index as u8));
+        read_size += chunk.len() as u64;
+      }
+      assert_eq!(read_size, size);
+      *hits += 1;
+    }
+    Err(OpError::ObjectNotFound) => *misses += 1,
+    Err(err) => panic!("unexpected cache read error: {err}"),
+  }
 }
 
 // Utility function to calculate percentiles from latencies
@@ -266,8 +396,26 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
   let stop_script = benchmark_dir.join("stop.sh");
 
   // Parse config first to resolve values
-  let cfg: Config = serde_yaml::from_str(&fs::read_to_string(&cfg_file).expect("read config file"))
-    .expect("parse config file");
+  let mut cfg: Config =
+    serde_yaml::from_str(&fs::read_to_string(&cfg_file).expect("read config file"))
+      .expect("parse config file");
+  if cli.device.is_some() || cli.partition_len.is_some() {
+    assert_eq!(
+      cfg.target,
+      TargetType::Direct,
+      "device overrides require direct storage"
+    );
+    let partition = cfg
+      .partitions
+      .first_mut()
+      .expect("direct storage needs a partition");
+    if let Some(device) = &cli.device {
+      partition.path = device.clone();
+    }
+    if let Some(len) = cli.partition_len {
+      partition.len = len;
+    }
+  }
 
   // Resolve effective values (CLI overrides config)
   let buckets = cli.buckets.or(cfg.buckets).unwrap_or(0);
@@ -283,9 +431,33 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
     .concurrency
     .or(cfg.concurrency)
     .expect("concurrency must be specified in config or CLI");
+  if cli.cache_eviction {
+    assert_eq!(
+      cfg.target,
+      TargetType::Direct,
+      "CLOCK is only supported by direct storage"
+    );
+  }
+  if cli.cache_pressure {
+    assert!(
+      !cli.skip_device_format,
+      "cache pressure requires a fresh partition"
+    );
+    assert!(
+      object_size <= cfg.lpage_size.as_u64(),
+      "pressure object size must fit one lpage"
+    );
+  }
 
   // Construct results file path using resolved values
-  let results_file = benchmark_dir.join(format!("results.{}o.{}b.json", objects, object_size));
+  let mode = if cli.cache_pressure {
+    "pressure"
+  } else if cli.cache_eviction {
+    "clock"
+  } else {
+    "baseline"
+  };
+  let results_file = benchmark_dir.join(format!("results.{mode}.{objects}o.{object_size}b.json"));
 
   // Run start.sh if it exists
   let ran_start_script = if start_script.exists() {
@@ -318,6 +490,7 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
     object_size,
     concurrency,
     op: OpResults::default(),
+    cache_pressure: None,
     wait_for_end_secs: 0.0,
     store_metrics: HashMap::<String, u64>::new(),
     system_metrics: FinalSystemMetrics::default(),
@@ -332,6 +505,7 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
 
   let init_cfg = InitCfg {
     bucket_count,
+    cache_eviction: cli.cache_eviction,
     do_not_format_device: cli.skip_device_format,
     log_buffer_size: cfg.log_buffer_size.as_u64(),
     lpage_size,
@@ -348,7 +522,14 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
       .collect(),
   };
 
+  let mut pressure_result = None;
   let store: Arc<dyn Store> = match cfg.target {
+    TargetType::Direct if cli.cache_pressure => {
+      let direct = BlobdDirectStore::start(init_cfg).await;
+      pressure_result =
+        Some(run_cache_pressure(direct.blobd(), objects, object_size, spage_size).await);
+      Arc::new(direct)
+    }
     TargetType::Direct => Arc::new(BlobdDirectStore::start(init_cfg).await),
     TargetType::KV => Arc::new(BlobdKVStore::start(init_cfg).await),
     TargetType::Lite => Arc::new(BlobdLiteStore::start(init_cfg).await),
@@ -375,10 +556,145 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
     )),
   };
 
-  if !cli.skip_creation {
-    let incomplete_tokens = Arc::new(parking_lot::Mutex::new(Vec::new()));
+  results.cache_pressure = pressure_result;
 
-    let create_started = Utc::now();
+  if !cli.cache_pressure {
+    if !cli.skip_creation {
+      let incomplete_tokens = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+      let create_started = Utc::now();
+      let now = Instant::now();
+      let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+      let indices = shuffle_indices(object_count);
+
+      iter(indices)
+        .for_each_concurrent(concurrency, async |i| {
+          let store = store.clone();
+          let incomplete_tokens = incomplete_tokens.clone();
+          let latencies = latencies.clone();
+          spawn(async move {
+            let op_start = Instant::now();
+            let res = store
+              .create_object(CreateObjectInput {
+                key: create_u64_be(i).into(),
+                size: object_size,
+              })
+              .await;
+            let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+            incomplete_tokens.lock().push((i, res.token));
+            latencies.lock().push(latency_ms);
+          })
+          .await
+          .unwrap();
+        })
+        .await;
+
+      let create_exec_secs = now.elapsed().as_secs_f64();
+      let latency_stats = calculate_percentiles(latencies.lock().clone());
+      results.op.create = Some(OpResult {
+        started: create_started,
+        exec_secs: create_exec_secs,
+        latency: latency_stats.clone(),
+        ttfb: None,
+      });
+      info!(
+        create_exec_secs,
+        create_ops_per_second = (object_count as f64) / create_exec_secs,
+        "completed all create ops",
+      );
+
+      let write_started = Utc::now();
+      let now = Instant::now();
+      let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+      let mut tokens_vec = incomplete_tokens.lock().to_vec();
+      tokens_vec.shuffle(&mut thread_rng());
+
+      iter(tokens_vec)
+        .for_each_concurrent(concurrency, async |(key, incomplete_token)| {
+          let store = store.clone();
+          let latencies = latencies.clone();
+          let rand_pool = rand_pool.clone();
+          spawn(async move {
+            let op_start = Instant::now();
+            let write_chunk_size = store.write_chunk_size();
+            for offset in (0..object_size).step_by(usz!(write_chunk_size)) {
+              let data_len = min(object_size - offset, write_chunk_size);
+              store
+                .write_object(WriteObjectInput {
+                  key: create_u64_be(key).into(),
+                  offset,
+                  incomplete_token: incomplete_token.clone(),
+                  data: &rand_pool[usz!(offset)..usz!(offset + data_len)],
+                })
+                .await;
+            }
+            let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+            latencies.lock().push(latency_ms);
+          })
+          .await
+          .unwrap();
+        })
+        .await;
+
+      let write_exec_secs = now.elapsed().as_secs_f64();
+      let latency_stats = calculate_percentiles(latencies.lock().clone());
+      results.op.write = Some(OpResult {
+        started: write_started,
+        exec_secs: write_exec_secs,
+        latency: latency_stats.clone(),
+        ttfb: None,
+      });
+      info!(
+        write_exec_secs,
+        write_ops_per_second = object_count as f64 / write_exec_secs,
+        write_mib_per_second =
+          (object_count * object_size) as f64 / write_exec_secs / 1024.0 / 1024.0,
+        "completed all write ops",
+      );
+
+      let commit_started = Utc::now();
+      let now = Instant::now();
+      let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+      let mut tokens_vec = incomplete_tokens.lock().to_vec();
+      tokens_vec.shuffle(&mut thread_rng());
+
+      iter(tokens_vec)
+        .for_each_concurrent(concurrency, async |(i, incomplete_token)| {
+          let store = store.clone();
+          let latencies = latencies.clone();
+          spawn(async move {
+            let op_start = Instant::now();
+            let key = create_u64_be(i).into();
+            store
+              .commit_object(CommitObjectInput {
+                incomplete_token: incomplete_token.clone(),
+                key,
+              })
+              .await;
+            let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+            latencies.lock().push(latency_ms);
+          })
+          .await
+          .unwrap();
+        })
+        .await;
+
+      let commit_exec_secs = now.elapsed().as_secs_f64();
+      let latency_stats = calculate_percentiles(latencies.lock().clone());
+      results.op.commit = Some(OpResult {
+        started: commit_started,
+        exec_secs: commit_exec_secs,
+        latency: latency_stats.clone(),
+        ttfb: None,
+      });
+      info!(
+        commit_exec_secs,
+        commit_ops_per_second = (object_count as f64) / commit_exec_secs,
+        "completed all commit ops",
+      );
+    };
+
+    let inspect_started = Utc::now();
     let now = Instant::now();
     let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let indices = shuffle_indices(object_count);
@@ -386,18 +702,16 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
     iter(indices)
       .for_each_concurrent(concurrency, async |i| {
         let store = store.clone();
-        let incomplete_tokens = incomplete_tokens.clone();
         let latencies = latencies.clone();
         spawn(async move {
           let op_start = Instant::now();
-          let res = store
-            .create_object(CreateObjectInput {
+          store
+            .inspect_object(InspectObjectInput {
               key: create_u64_be(i).into(),
-              size: object_size,
+              id: None,
             })
             .await;
           let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-          incomplete_tokens.lock().push((i, res.token));
           latencies.lock().push(latency_ms);
         })
         .await
@@ -405,255 +719,58 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
       })
       .await;
 
-    let create_exec_secs = now.elapsed().as_secs_f64();
+    let inspect_exec_secs = now.elapsed().as_secs_f64();
     let latency_stats = calculate_percentiles(latencies.lock().clone());
-    results.op.create = Some(OpResult {
-      started: create_started,
-      exec_secs: create_exec_secs,
+    results.op.inspect = Some(OpResult {
+      started: inspect_started,
+      exec_secs: inspect_exec_secs,
       latency: latency_stats.clone(),
       ttfb: None,
     });
     info!(
-      create_exec_secs,
-      create_ops_per_second = (object_count as f64) / create_exec_secs,
-      "completed all create ops",
+      inspect_exec_secs,
+      inspect_ops_per_second = (object_count as f64) / inspect_exec_secs,
+      "completed all inspect ops",
     );
 
-    let write_started = Utc::now();
+    // Random read phase: read random 4000-byte ranges
+    drop_caches();
+    let random_read_started = Utc::now();
     let now = Instant::now();
     let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let mut tokens_vec = incomplete_tokens.lock().to_vec();
-    tokens_vec.shuffle(&mut thread_rng());
+    let ttfb_latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let indices = shuffle_indices(object_count);
 
-    iter(tokens_vec)
-      .for_each_concurrent(concurrency, async |(key, incomplete_token)| {
+    iter(indices.clone())
+      .for_each_concurrent(concurrency, async |i| {
         let store = store.clone();
         let latencies = latencies.clone();
+        let ttfb_latencies = ttfb_latencies.clone();
         let rand_pool = rand_pool.clone();
         spawn(async move {
           let op_start = Instant::now();
-          let write_chunk_size = store.write_chunk_size();
-          for offset in (0..object_size).step_by(usz!(write_chunk_size)) {
-            let data_len = min(object_size - offset, write_chunk_size);
-            store
-              .write_object(WriteObjectInput {
-                key: create_u64_be(key).into(),
-                offset,
-                incomplete_token: incomplete_token.clone(),
-                data: &rand_pool[usz!(offset)..usz!(offset + data_len)],
-              })
-              .await;
-          }
-          let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-          latencies.lock().push(latency_ms);
-        })
-        .await
-        .unwrap();
-      })
-      .await;
+          // Pick random offset (ensure at least 4000 bytes available)
+          let random_offset = if object_size > 4000 {
+            thread_rng().gen_range(0..object_size - 4000)
+          } else {
+            0
+          };
+          let read_len = min(4000, object_size);
 
-    let write_exec_secs = now.elapsed().as_secs_f64();
-    let latency_stats = calculate_percentiles(latencies.lock().clone());
-    results.op.write = Some(OpResult {
-      started: write_started,
-      exec_secs: write_exec_secs,
-      latency: latency_stats.clone(),
-      ttfb: None,
-    });
-    info!(
-      write_exec_secs,
-      write_ops_per_second = object_count as f64 / write_exec_secs,
-      write_mib_per_second =
-        (object_count * object_size) as f64 / write_exec_secs / 1024.0 / 1024.0,
-      "completed all write ops",
-    );
-
-    let commit_started = Utc::now();
-    let now = Instant::now();
-    let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let mut tokens_vec = incomplete_tokens.lock().to_vec();
-    tokens_vec.shuffle(&mut thread_rng());
-
-    iter(tokens_vec)
-      .for_each_concurrent(concurrency, async |(i, incomplete_token)| {
-        let store = store.clone();
-        let latencies = latencies.clone();
-        spawn(async move {
-          let op_start = Instant::now();
-          let key = create_u64_be(i).into();
-          store
-            .commit_object(CommitObjectInput {
-              incomplete_token: incomplete_token.clone(),
-              key,
-            })
-            .await;
-          let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-          latencies.lock().push(latency_ms);
-        })
-        .await
-        .unwrap();
-      })
-      .await;
-
-    let commit_exec_secs = now.elapsed().as_secs_f64();
-    let latency_stats = calculate_percentiles(latencies.lock().clone());
-    results.op.commit = Some(OpResult {
-      started: commit_started,
-      exec_secs: commit_exec_secs,
-      latency: latency_stats.clone(),
-      ttfb: None,
-    });
-    info!(
-      commit_exec_secs,
-      commit_ops_per_second = (object_count as f64) / commit_exec_secs,
-      "completed all commit ops",
-    );
-  };
-
-  let inspect_started = Utc::now();
-  let now = Instant::now();
-  let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-  let indices = shuffle_indices(object_count);
-
-  iter(indices)
-    .for_each_concurrent(concurrency, async |i| {
-      let store = store.clone();
-      let latencies = latencies.clone();
-      spawn(async move {
-        let op_start = Instant::now();
-        store
-          .inspect_object(InspectObjectInput {
-            key: create_u64_be(i).into(),
-            id: None,
-          })
-          .await;
-        let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-        latencies.lock().push(latency_ms);
-      })
-      .await
-      .unwrap();
-    })
-    .await;
-
-  let inspect_exec_secs = now.elapsed().as_secs_f64();
-  let latency_stats = calculate_percentiles(latencies.lock().clone());
-  results.op.inspect = Some(OpResult {
-    started: inspect_started,
-    exec_secs: inspect_exec_secs,
-    latency: latency_stats.clone(),
-    ttfb: None,
-  });
-  info!(
-    inspect_exec_secs,
-    inspect_ops_per_second = (object_count as f64) / inspect_exec_secs,
-    "completed all inspect ops",
-  );
-
-  // Random read phase: read random 4000-byte ranges
-  drop_caches();
-  let random_read_started = Utc::now();
-  let now = Instant::now();
-  let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-  let ttfb_latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-  let indices = shuffle_indices(object_count);
-
-  iter(indices.clone())
-    .for_each_concurrent(concurrency, async |i| {
-      let store = store.clone();
-      let latencies = latencies.clone();
-      let ttfb_latencies = ttfb_latencies.clone();
-      let rand_pool = rand_pool.clone();
-      spawn(async move {
-        let op_start = Instant::now();
-        // Pick random offset (ensure at least 4000 bytes available)
-        let random_offset = if object_size > 4000 {
-          thread_rng().gen_range(0..object_size - 4000)
-        } else {
-          0
-        };
-        let read_len = min(4000, object_size);
-
-        let mut res = store
-          .read_object(ReadObjectInput {
-            key: create_u64_be(i).into(),
-            id: None,
-            start: random_offset,
-            end: Some(random_offset + read_len),
-            stream_buffer_size: read_stream_buffer_size,
-          })
-          .await;
-
-        // Measure TTFB: time to first chunk
-        let mut ttfb_recorded = false;
-        let mut offset = usz!(random_offset);
-        while let Some(chunk) = res.data_stream.next().await {
-          if !ttfb_recorded {
-            let ttfb_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-            ttfb_latencies.lock().push(ttfb_ms);
-            ttfb_recorded = true;
-          }
-          assert_eq!(chunk, rand_pool[offset..offset + chunk.len()]);
-          offset += chunk.len();
-        }
-
-        let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-        latencies.lock().push(latency_ms);
-      })
-      .await
-      .unwrap();
-    })
-    .await;
-
-  let random_read_exec_secs = now.elapsed().as_secs_f64();
-  let latency_stats = calculate_percentiles(latencies.lock().clone());
-  let ttfb_stats = calculate_percentiles(ttfb_latencies.lock().clone());
-  results.op.random_read = Some(OpResult {
-    started: random_read_started,
-    exec_secs: random_read_exec_secs,
-    latency: latency_stats.clone(),
-    ttfb: Some(ttfb_stats.clone()),
-  });
-  info!(
-    random_read_exec_secs,
-    random_read_ops_per_second = object_count as f64 / random_read_exec_secs,
-    "completed all random read ops",
-  );
-
-  // Regular read phase
-  drop_caches();
-  let read_started = Utc::now();
-  let now = Instant::now();
-  let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-  let ttfb_latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-  let indices = shuffle_indices(object_count);
-
-  iter(indices)
-    .for_each_concurrent(concurrency, async |i| {
-      let store = store.clone();
-      let latencies = latencies.clone();
-      let ttfb_latencies = ttfb_latencies.clone();
-      let rand_pool = rand_pool.clone();
-      spawn(async move {
-        let op_start = Instant::now();
-        let mut ttfb_recorded = false;
-
-        for start in (0..object_size).step_by(usz!(read_size)) {
-          let read_len = min(object_size, start + read_size) - start;
           let mut res = store
             .read_object(ReadObjectInput {
               key: create_u64_be(i).into(),
               id: None,
-              start,
-              end: Some(start + read_len),
+              start: random_offset,
+              end: Some(random_offset + read_len),
               stream_buffer_size: read_stream_buffer_size,
             })
             .await;
 
-          // Do something sophisticated with the response data so the compiler doesnt just drop it and we get insane "read throughput".
-          // WARNING: At max opt levels, the compiler is very aggressive! Even something like checking if len() is greater than 0 may mean compiler drops as soon as one byte is read! Or if only checking length, then it may just skip reading data and just check length only.
-          let mut offset = usz!(start);
+          // Measure TTFB: time to first chunk
+          let mut ttfb_recorded = false;
+          let mut offset = usz!(random_offset);
           while let Some(chunk) = res.data_stream.next().await {
-            // Record TTFB on first chunk of first read
             if !ttfb_recorded {
               let ttfb_ms = op_start.elapsed().as_secs_f64() * 1000.0;
               ttfb_latencies.lock().push(ttfb_ms);
@@ -662,50 +779,7 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
             assert_eq!(chunk, rand_pool[offset..offset + chunk.len()]);
             offset += chunk.len();
           }
-        }
 
-        let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
-        latencies.lock().push(latency_ms);
-      })
-      .await
-      .unwrap();
-    })
-    .await;
-
-  let read_exec_secs = now.elapsed().as_secs_f64();
-  let latency_stats = calculate_percentiles(latencies.lock().clone());
-  let ttfb_stats = calculate_percentiles(ttfb_latencies.lock().clone());
-  results.op.read = Some(OpResult {
-    started: read_started,
-    exec_secs: read_exec_secs,
-    latency: latency_stats.clone(),
-    ttfb: Some(ttfb_stats.clone()),
-  });
-  info!(
-    read_exec_secs,
-    read_ops_per_second = object_count as f64 / read_exec_secs,
-    read_mib_per_second = (object_count * object_size) as f64 / read_exec_secs / 1024.0 / 1024.0,
-    "completed all read ops",
-  );
-
-  if !cli.skip_deletion {
-    let delete_started = Utc::now();
-    let now = Instant::now();
-    let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let indices = shuffle_indices(object_count);
-
-    iter(indices)
-      .for_each_concurrent(concurrency, async |i| {
-        let store = store.clone();
-        let latencies = latencies.clone();
-        spawn(async move {
-          let op_start = Instant::now();
-          store
-            .delete_object(DeleteObjectInput {
-              key: create_u64_be(i).into(),
-              id: None,
-            })
-            .await;
           let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
           latencies.lock().push(latency_ms);
         })
@@ -714,20 +788,131 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
       })
       .await;
 
-    let delete_exec_secs = now.elapsed().as_secs_f64();
+    let random_read_exec_secs = now.elapsed().as_secs_f64();
     let latency_stats = calculate_percentiles(latencies.lock().clone());
-    results.op.delete = Some(OpResult {
-      started: delete_started,
-      exec_secs: delete_exec_secs,
+    let ttfb_stats = calculate_percentiles(ttfb_latencies.lock().clone());
+    results.op.random_read = Some(OpResult {
+      started: random_read_started,
+      exec_secs: random_read_exec_secs,
       latency: latency_stats.clone(),
-      ttfb: None,
+      ttfb: Some(ttfb_stats.clone()),
     });
     info!(
-      delete_exec_secs,
-      delete_ops_per_second = (object_count as f64) / delete_exec_secs,
-      "completed all delete ops",
+      random_read_exec_secs,
+      random_read_ops_per_second = object_count as f64 / random_read_exec_secs,
+      "completed all random read ops",
     );
-  };
+
+    // Regular read phase
+    drop_caches();
+    let read_started = Utc::now();
+    let now = Instant::now();
+    let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let ttfb_latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let indices = shuffle_indices(object_count);
+
+    iter(indices)
+      .for_each_concurrent(concurrency, async |i| {
+        let store = store.clone();
+        let latencies = latencies.clone();
+        let ttfb_latencies = ttfb_latencies.clone();
+        let rand_pool = rand_pool.clone();
+        spawn(async move {
+          let op_start = Instant::now();
+          let mut ttfb_recorded = false;
+
+          for start in (0..object_size).step_by(usz!(read_size)) {
+            let read_len = min(object_size, start + read_size) - start;
+            let mut res = store
+              .read_object(ReadObjectInput {
+                key: create_u64_be(i).into(),
+                id: None,
+                start,
+                end: Some(start + read_len),
+                stream_buffer_size: read_stream_buffer_size,
+              })
+              .await;
+
+            // Do something sophisticated with the response data so the compiler doesnt just drop it and we get insane "read throughput".
+            // WARNING: At max opt levels, the compiler is very aggressive! Even something like checking if len() is greater than 0 may mean compiler drops as soon as one byte is read! Or if only checking length, then it may just skip reading data and just check length only.
+            let mut offset = usz!(start);
+            while let Some(chunk) = res.data_stream.next().await {
+              // Record TTFB on first chunk of first read
+              if !ttfb_recorded {
+                let ttfb_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+                ttfb_latencies.lock().push(ttfb_ms);
+                ttfb_recorded = true;
+              }
+              assert_eq!(chunk, rand_pool[offset..offset + chunk.len()]);
+              offset += chunk.len();
+            }
+          }
+
+          let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+          latencies.lock().push(latency_ms);
+        })
+        .await
+        .unwrap();
+      })
+      .await;
+
+    let read_exec_secs = now.elapsed().as_secs_f64();
+    let latency_stats = calculate_percentiles(latencies.lock().clone());
+    let ttfb_stats = calculate_percentiles(ttfb_latencies.lock().clone());
+    results.op.read = Some(OpResult {
+      started: read_started,
+      exec_secs: read_exec_secs,
+      latency: latency_stats.clone(),
+      ttfb: Some(ttfb_stats.clone()),
+    });
+    info!(
+      read_exec_secs,
+      read_ops_per_second = object_count as f64 / read_exec_secs,
+      read_mib_per_second = (object_count * object_size) as f64 / read_exec_secs / 1024.0 / 1024.0,
+      "completed all read ops",
+    );
+
+    if !cli.skip_deletion {
+      let delete_started = Utc::now();
+      let now = Instant::now();
+      let latencies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+      let indices = shuffle_indices(object_count);
+
+      iter(indices)
+        .for_each_concurrent(concurrency, async |i| {
+          let store = store.clone();
+          let latencies = latencies.clone();
+          spawn(async move {
+            let op_start = Instant::now();
+            store
+              .delete_object(DeleteObjectInput {
+                key: create_u64_be(i).into(),
+                id: None,
+              })
+              .await;
+            let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+            latencies.lock().push(latency_ms);
+          })
+          .await
+          .unwrap();
+        })
+        .await;
+
+      let delete_exec_secs = now.elapsed().as_secs_f64();
+      let latency_stats = calculate_percentiles(latencies.lock().clone());
+      results.op.delete = Some(OpResult {
+        started: delete_started,
+        exec_secs: delete_exec_secs,
+        latency: latency_stats.clone(),
+        ttfb: None,
+      });
+      info!(
+        delete_exec_secs,
+        delete_ops_per_second = (object_count as f64) / delete_exec_secs,
+        "completed all delete ops",
+      );
+    };
+  }
 
   info!("waiting for store to end (flush/compact/etc)");
   let wait_start = Instant::now();
@@ -779,7 +964,9 @@ async fn run_benchmark(benchmark_name: String, benchmark_dir: PathBuf, cli: &Cli
   }
 
   // Always cleanup memory after benchmarking
-  cleanup_memory();
+  if !cli.skip_cache_drop {
+    cleanup_memory();
+  }
 
   // Write results to benchmark folder
   let json_output = serde_json::to_string_pretty(&results).expect("failed to serialize results");

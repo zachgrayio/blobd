@@ -1,4 +1,4 @@
-use super::delete_object::reap_object;
+use super::delete_object::reap_object_deferred;
 use super::OpError;
 use super::OpResult;
 use crate::ctx::Ctx;
@@ -26,6 +26,16 @@ pub(crate) async fn op_commit_object(
   ctx: Arc<Ctx>,
   req: OpCommitObjectInput,
 ) -> OpResult<OpCommitObjectOutput> {
+  tokio::spawn(async move { commit_object_inner(ctx, req).await })
+    .await
+    .expect("commit task failed")
+}
+
+async fn commit_object_inner(
+  ctx: Arc<Ctx>,
+  req: OpCommitObjectInput,
+) -> OpResult<OpCommitObjectOutput> {
+  let _lifecycle = ctx.lifecycle.lock().await;
   let Some(obj) = ctx
     .incomplete_objects
     .write()
@@ -45,9 +55,9 @@ pub(crate) async fn op_commit_object(
       let new_object_id: ObjectId = thread_rng().gen();
       let new_obj = obj.with_new_id(new_object_id);
       let existing = match e {
-        Entry::Occupied(mut e) => Some(e.insert(new_obj)),
+        Entry::Occupied(mut e) => Some(e.insert(new_obj.clone())),
         Entry::Vacant(e) => {
-          e.insert(new_obj);
+          e.insert(new_obj.clone());
           None
         }
       };
@@ -59,6 +69,9 @@ pub(crate) async fn op_commit_object(
           ObjectState::Committed,
         )
         .await;
+      if ctx.cache_eviction {
+        ctx.clock.register(&new_obj);
+      }
       (existing, Some(new_object_id))
     }
   };
@@ -66,7 +79,10 @@ pub(crate) async fn op_commit_object(
   // Only delete AFTER we're certain the updated object tuple we're committing has been persisted to disk.
   // See `op_delete_object` for why this is safe to do at any time for a committed object.
   if let Some(to_delete) = to_delete.as_ref() {
-    reap_object(&ctx, to_delete).await;
+    if ctx.cache_eviction && new_object_id.is_some() {
+      ctx.clock.remove(to_delete);
+    }
+    reap_object_deferred(ctx.clone(), to_delete.clone()).await;
   };
 
   ctx

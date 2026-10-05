@@ -52,14 +52,22 @@ async fn main() {
       len: conf.device.len,
     }],
     BlobdCfg {
+      #[cfg(not(target_os = "linux"))]
+      backing_store: BlobdCfgBackingStore::File,
+      #[cfg(target_os = "linux")]
       backing_store: BlobdCfgBackingStore::Uring,
+      cache_eviction: conf.cache_eviction,
       expire_incomplete_objects_after_secs: conf.reap_objects_after_secs,
       lpage_size_pow2: conf.lpage_size_pow2,
       object_tuples_area_reserved_space: conf.object_tuples_area_reserved_space,
       spage_size_pow2: conf.spage_size_pow2,
+      #[cfg(target_os = "linux")]
       uring_coop_taskrun: false,
+      #[cfg(target_os = "linux")]
       uring_defer_taskrun: false,
+      #[cfg(target_os = "linux")]
       uring_iopoll: false,
+      #[cfg(target_os = "linux")]
       uring_sqpoll: None,
     },
   );

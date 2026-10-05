@@ -70,14 +70,14 @@ impl Tuples {
     }
   }
 
-  pub async fn insert_object(&self, o: ObjectTuple) {
+  pub async fn insert_object(&self, o: ObjectTuple) -> Result<(), ()> {
     let fut = {
       let mut state = self.state.lock();
       let bundle_id = state
         .free_and_dirty_bundles
         .min()
         .or_else(|| state.free_bundles.min())
-        .expect("run out of space for tuples");
+        .ok_or(())?;
       assert!(state.object_id_to_bundle.insert(o.id, bundle_id).is_none());
       let bundle = &mut state.bundle_tuples[usz!(bundle_id)];
       assert!(bundle.insert(o.id, o).is_none());
@@ -94,6 +94,7 @@ impl Tuples {
       fut
     };
     fut.await;
+    Ok(())
   }
 
   pub async fn update_object_id_and_state(
@@ -134,6 +135,7 @@ impl Tuples {
       let tuple = state.bundle_tuples[usz!(bundle_id)]
         .remove(&object_id)
         .unwrap();
+      state.free_bundles.insert(bundle_id);
       state.free_and_dirty_bundles.insert(bundle_id);
       state.dirty_bundles.insert(bundle_id);
       let (fut, fut_ctl) = SignalFuture::new();

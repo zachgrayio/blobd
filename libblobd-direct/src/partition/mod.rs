@@ -1,4 +1,5 @@
 use crate::backing_store::PartitionStore;
+use crate::clock::Clock;
 use crate::ctx::Ctx;
 use crate::metrics::BlobdMetrics;
 use crate::objects::format_device_for_objects;
@@ -23,6 +24,7 @@ pub(crate) struct PartitionLoader {
   partition_idx: usize,
   heap_dev_offset: u64,
   heap_size: u64,
+  cache_eviction: bool,
 }
 
 impl PartitionLoader {
@@ -52,6 +54,7 @@ impl PartitionLoader {
       dev: partition_store,
       heap_dev_offset,
       heap_size,
+      cache_eviction: cfg.cache_eviction,
       metrics,
       pages,
       partition_idx,
@@ -86,15 +89,25 @@ impl PartitionLoader {
     )
     .await;
 
+    let clock = Clock::default();
+    if self.cache_eviction {
+      for object in committed_objects.iter() {
+        clock.register(object.value());
+      }
+    }
     let ctx = Arc::new(Ctx {
+      clock,
+      cache_eviction: self.cache_eviction,
       committed_objects,
       device: self.dev.clone(),
       heap_allocator: Mutex::new(heap_allocator),
+      heap_size: self.heap_size,
       incomplete_objects,
       metrics: self.metrics.clone(),
       pages: pages.clone(),
       partition_idx: self.partition_idx,
       tuples: tuples.clone(),
+      lifecycle: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     spawn({

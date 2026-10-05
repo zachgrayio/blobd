@@ -145,6 +145,15 @@ pub struct OpResults {
   pub delete: Option<OpResult>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct CachePressureResult {
+  pub exec_secs: f64,
+  pub writes: u64,
+  pub read_hits: u64,
+  pub read_misses: u64,
+  pub evictions: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct FinalSystemMetrics {
   pub peak_memory_bytes: u64,
@@ -165,6 +174,8 @@ pub struct BenchmarkResults {
   pub object_size: u64,
   pub concurrency: usize,
   pub op: OpResults,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cache_pressure: Option<CachePressureResult>,
   pub wait_for_end_secs: f64,
   pub store_metrics: HashMap<String, u64>,
   pub system_metrics: FinalSystemMetrics,

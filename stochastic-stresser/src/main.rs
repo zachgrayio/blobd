@@ -3,9 +3,11 @@ use futures::StreamExt;
 use off64::int::create_u64_le;
 use off64::u64;
 use off64::usz;
+use rand::rngs::StdRng;
 use rand::thread_rng;
 use rand::Rng;
 use rand::RngCore;
+use rand::SeedableRng;
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -72,6 +74,9 @@ struct ConfigPartition {
 struct Config {
   target: TargetType,
 
+  #[serde(default)]
+  cache_eviction: bool,
+
   /// For the "lite" target, there must only be one partition and its offset must be zero.
   partitions: Vec<ConfigPartition>,
 
@@ -93,6 +98,9 @@ struct Config {
   /// Size of random bytes pool. Defaults to 1 GiB.
   pool_size: Option<ByteSize>,
 
+  /// Reuse the same generated data and task inputs across runs.
+  seed: Option<u64>,
+
   /// Lpage size. Defaults to 16 MiB.
   lpage_size: Option<ByteSize>,
 
@@ -109,9 +117,13 @@ struct Pool {
 }
 
 impl Pool {
-  fn new(size: u64) -> Self {
+  fn new(size: u64, seed: Option<u64>) -> Self {
     let mut data = vec![0u8; usize::try_from(size).unwrap()];
-    thread_rng().fill_bytes(&mut data);
+    if let Some(seed) = seed {
+      StdRng::seed_from_u64(seed).fill_bytes(&mut data);
+    } else {
+      thread_rng().fill_bytes(&mut data);
+    }
     Self {
       data: Arc::new(data),
     }
@@ -198,11 +210,22 @@ async fn main() {
   #[cfg(not(feature = "instrumentation"))]
   tracing_subscriber::fmt::init();
 
-  let cli: Config = serde_yaml::from_str(
-    &fs::read_to_string(env::args().nth(1).expect("config file path argument"))
-      .expect("read config file"),
-  )
-  .expect("parse config file");
+  let mut args = env::args().skip(1);
+  let config_path = args.next().expect("config file path argument");
+  let enable_cache_eviction = match args.next().as_deref() {
+    None => false,
+    Some("--cache-eviction") => true,
+    Some(other) => panic!("unexpected argument: {other}"),
+  };
+  assert!(args.next().is_none(), "unexpected extra argument");
+  let mut cli: Config =
+    serde_yaml::from_str(&fs::read_to_string(config_path).expect("read config file"))
+      .expect("parse config file");
+  cli.cache_eviction |= enable_cache_eviction;
+  assert!(
+    !cli.cache_eviction || cli.target == TargetType::Direct,
+    "cache_eviction is only supported for the Direct target"
+  );
   let object_count = cli.objects;
   let bucket_count = cli.buckets.unwrap_or(object_count * 2);
   let concurrency = cli.concurrency.unwrap_or(64);
@@ -213,10 +236,12 @@ async fn main() {
     .pool_size
     .map(|s| s.as_u64())
     .unwrap_or(1024 * 1024 * 1024 * 1);
+  let seed = cli.seed;
   let spage_size = cli.spage_size.map(|s| s.as_u64()).unwrap_or(512);
 
   let cfg = InitCfg {
     bucket_count,
+    cache_eviction: cli.cache_eviction,
     do_not_format_device: false,
     log_buffer_size: cli
       .log_buffer_size
@@ -245,12 +270,16 @@ async fn main() {
     "initialising pool of size {}, this may take a while",
     ByteSize(pool_size)
   );
-  let pool = Pool::new(pool_size);
+  let pool = Pool::new(pool_size, seed);
   info!("pool initialised");
-  let key_len_seed = thread_rng().next_u64();
-  let key_offset_seed = thread_rng().next_u64();
-  let data_len_seed = thread_rng().next_u64();
-  let data_offset_seed = thread_rng().next_u64();
+  let mut rng: Box<dyn RngCore> = match seed {
+    Some(seed) => Box::new(StdRng::seed_from_u64(seed.wrapping_add(1))),
+    None => Box::new(thread_rng()),
+  };
+  let key_len_seed = rng.next_u64();
+  let key_offset_seed = rng.next_u64();
+  let data_len_seed = rng.next_u64();
+  let data_offset_seed = rng.next_u64();
 
   // Progress bars would look nice and fancy, but we are more likely to want logs/traces than in-flight animations, and a summary of performance metrics at the end will be enough. Using progress bars will clash with the logger.
 
@@ -479,7 +508,14 @@ async fn main() {
             object_id,
           } => {
             // Read a random amount to test various cases stochastically.
-            let end = thread_rng().gen_range(chunk_offset + 1..=data_len);
+            let end = if let Some(seed) = seed {
+              chunk_offset
+                + 1
+                + hash64_with_seed(&key_prefix.to_be_bytes(), seed ^ chunk_offset)
+                  % (data_len - chunk_offset)
+            } else {
+              thread_rng().gen_range(chunk_offset + 1..=data_len)
+            };
             let mut res = blobd
               .read_object(ReadObjectInput {
                 end: Some(end),

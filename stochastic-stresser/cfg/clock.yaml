@@ -1,0 +1,13 @@
+target: Direct
+partitions:
+  - path: /tmp/blobd-clock-device
+    offset: 0
+    len: 16777216
+objects: 400
+maximum_object_size: 16384
+object_key_len_max: 32
+concurrency: 8
+pool_size: 1048576
+seed: 42
+lpage_size: 16384
+spage_size: 512

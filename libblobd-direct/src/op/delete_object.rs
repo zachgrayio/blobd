@@ -3,13 +3,27 @@ use super::OpResult;
 use crate::ctx::Ctx;
 use crate::object::calc_object_layout;
 use crate::object::Object;
+use crate::object::ObjectTuple;
 use off64::usz;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 pub(crate) async fn reap_object(ctx: &Ctx, obj: &Object) {
   let tuple = ctx.tuples.delete_object(obj.id()).await;
+  obj.wait_for_readers().await;
 
+  release_object(ctx, obj, tuple);
+}
+
+pub(crate) async fn reap_object_deferred(ctx: Arc<Ctx>, obj: Object) {
+  let tuple = ctx.tuples.delete_object(obj.id()).await;
+  tokio::spawn(async move {
+    obj.wait_for_readers().await;
+    release_object(&ctx, &obj, tuple);
+  });
+}
+
+fn release_object(ctx: &Ctx, obj: &Object, tuple: ObjectTuple) {
   let layout = calc_object_layout(&ctx.pages, obj.size);
 
   {
@@ -45,6 +59,16 @@ pub(crate) async fn op_delete_object(
   ctx: Arc<Ctx>,
   req: OpDeleteObjectInput,
 ) -> OpResult<OpDeleteObjectOutput> {
+  tokio::spawn(async move { delete_object_inner(ctx, req).await })
+    .await
+    .expect("delete task failed")
+}
+
+async fn delete_object_inner(
+  ctx: Arc<Ctx>,
+  req: OpDeleteObjectInput,
+) -> OpResult<OpDeleteObjectOutput> {
+  let _lifecycle = ctx.lifecycle.lock().await;
   let Some((_, obj)) = ctx
     .committed_objects
     .remove_if(&req.key, |_, o| req.id.is_none() || Some(o.id()) == req.id)
@@ -52,8 +76,11 @@ pub(crate) async fn op_delete_object(
     return Err(OpError::ObjectNotFound);
   };
 
+  if ctx.cache_eviction {
+    ctx.clock.remove(&obj);
+  }
   // We can reap the object now, as there should only be other readers (it's committed, so there shouldn't be any writers), and readers will double check the state after reading and discard the read if necessary (the object metadata still exists in memory due to Arc, so it's safe to check).
-  reap_object(&ctx, &obj).await;
+  reap_object_deferred(ctx.clone(), obj).await;
 
   ctx.metrics.0.delete_op_count.fetch_add(1, Relaxed);
   ctx.metrics.0.committed_object_count.fetch_sub(1, Relaxed);

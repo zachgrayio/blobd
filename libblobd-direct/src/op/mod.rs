@@ -8,6 +8,7 @@ pub mod create_object;
 pub mod delete_object;
 pub mod inspect_object;
 pub mod read_object;
+pub mod touch_object;
 pub mod write_object;
 
 pub type OpResult<T> = Result<T, OpError>;
@@ -19,6 +20,7 @@ pub enum OpError {
   InexactWriteLength,
   ObjectMetadataTooLarge,
   ObjectNotFound,
+  OutOfSpace,
   RangeOutOfBounds,
   UnalignedWrite,
 }
@@ -36,6 +38,7 @@ impl Display for OpError {
       OpError::InexactWriteLength => write!(f, "data to write is not an exact chunk"),
       OpError::ObjectMetadataTooLarge => write!(f, "object metadata is too large"),
       OpError::ObjectNotFound => write!(f, "object does not exist"),
+      OpError::OutOfSpace => write!(f, "not enough free space"),
       OpError::RangeOutOfBounds => write!(f, "requested range to read or write is invalid"),
       OpError::UnalignedWrite => {
         write!(f, "data to write does not start at a multiple of TILE_SIZE")

@@ -17,9 +17,13 @@ use off64::usz;
 use serde::Deserialize;
 use serde::Serialize;
 use std::ops::Deref;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Weak;
+use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 
@@ -110,8 +114,19 @@ struct ObjectInner {
   id: ObjectId,
   metadata_size: u64, // How large the `metadata` is in bytes when serialised.
   state: AtomicU8,
-  lock: RwLock<()>,
+  lock: Arc<RwLock<()>>,
+  referenced: AtomicBool,
+  clock_slot: AtomicUsize,
   metadata: ObjectMetadata,
+}
+
+#[derive(Clone)]
+pub(crate) struct WeakObject(Weak<ObjectInner>);
+
+impl WeakObject {
+  pub fn upgrade(&self) -> Option<Object> {
+    self.0.upgrade().map(|inner| Object { inner })
+  }
 }
 
 #[derive(Clone)]
@@ -129,7 +144,9 @@ impl Object {
     Self {
       inner: Arc::new(ObjectInner {
         id,
-        lock: RwLock::new(()),
+        lock: Arc::new(RwLock::new(())),
+        referenced: AtomicBool::new(false),
+        clock_slot: AtomicUsize::new(usize::MAX),
         metadata,
         metadata_size,
         state: AtomicU8::new(state as u8),
@@ -148,6 +165,42 @@ impl Object {
 
   pub fn id(&self) -> ObjectId {
     self.inner.id
+  }
+
+  pub fn downgrade(&self) -> WeakObject {
+    WeakObject(Arc::downgrade(&self.inner))
+  }
+
+  pub fn same_object(&self, other: &Object) -> bool {
+    Arc::ptr_eq(&self.inner, &other.inner)
+  }
+
+  pub fn touch(&self) {
+    self.inner.referenced.store(true, Ordering::Relaxed);
+  }
+
+  pub fn take_reference(&self) -> bool {
+    self.inner.referenced.swap(false, Ordering::Relaxed)
+  }
+
+  pub fn clock_slot(&self) -> usize {
+    self.inner.clock_slot.load(Ordering::Relaxed)
+  }
+
+  pub fn set_clock_slot(&self, slot: usize) {
+    self.inner.clock_slot.store(slot, Ordering::Relaxed);
+  }
+
+  pub fn try_pin(&self) -> Option<OwnedRwLockReadGuard<()>> {
+    self.inner.lock.clone().try_read_owned().ok()
+  }
+
+  pub fn is_pinned(&self) -> bool {
+    self.inner.lock.try_write().is_err()
+  }
+
+  pub async fn wait_for_readers(&self) {
+    drop(self.inner.lock.write().await);
   }
 
   pub fn metadata_size(&self) -> u64 {
