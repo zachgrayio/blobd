@@ -12,6 +12,8 @@ pub struct ConfPartition {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conf {
+  #[serde(default)]
+  pub cache_eviction: bool,
   // As an initial value, consider setting this to `20 * max_objects / partition_count`, where `max_objects` is the expected peak amount of objects until the next resize of the tuples area (the tuples area can be resized in the future).
   pub object_tuples_area_reserved_space: u64,
   #[serde(default = "default_reap_objects_after_secs")]

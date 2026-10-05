@@ -35,6 +35,10 @@ pub struct BlobdDirectStore {
 }
 
 impl BlobdDirectStore {
+  pub fn blobd(&self) -> &Blobd {
+    &self.blobd
+  }
+
   pub async fn start(cfg: InitCfg) -> Self {
     let part_count = u64!(cfg.partitions.len());
     let blobd = BlobdLoader::new(
@@ -48,6 +52,7 @@ impl BlobdDirectStore {
         })
         .collect(),
       BlobdCfg {
+        cache_eviction: cfg.cache_eviction,
         #[cfg(not(target_os = "linux"))]
         backing_store: BlobdCfgBackingStore::File,
         #[cfg(target_os = "linux")]
@@ -104,6 +109,8 @@ impl Store for BlobdDirectStore {
 
       ("incomplete_object_count", metrics.incomplete_object_count()),
       ("committed_object_count", metrics.committed_object_count()),
+      ("evicted_object_count", metrics.evicted_object_count()),
+      ("evicted_bytes", metrics.evicted_bytes()),
     ]
   }
 

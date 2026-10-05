@@ -162,9 +162,9 @@ impl Allocator {
       u8!(size.next_power_of_two().ilog2()),
     );
     assert!(pow2 <= self.pages.lpage_size_pow2);
+    let page_num = self._allocate(pow2)?;
     // We increment these metrics here instead of in `Pages::*`, `Allocator::insert_into_free_list`, `Allocator::allocate_page`, etc. as many of those are called during intermediate states, like merging/splitting pages, which aren't actual allocations.
     self.metrics.0.allocated_bytes.fetch_add(1 << pow2, Relaxed);
-    let page_num = self._allocate(pow2)?;
     Ok(self.to_page_dev_offset(page_num, pow2))
   }
 

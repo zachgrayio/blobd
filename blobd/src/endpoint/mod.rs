@@ -114,6 +114,7 @@ pub fn transform_op_error(err: OpError) -> StatusCode {
     OpError::InexactWriteLength => StatusCode::RANGE_NOT_SATISFIABLE,
     OpError::ObjectMetadataTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
     OpError::ObjectNotFound => StatusCode::NOT_FOUND,
+    OpError::OutOfSpace => StatusCode::INSUFFICIENT_STORAGE,
     OpError::RangeOutOfBounds => StatusCode::RANGE_NOT_SATISFIABLE,
     OpError::UnalignedWrite => StatusCode::RANGE_NOT_SATISFIABLE,
   }

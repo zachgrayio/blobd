@@ -27,6 +27,8 @@ pub(crate) struct Inner {
 
   pub(crate) incomplete_object_count: AtomicU64,
   pub(crate) committed_object_count: AtomicU64,
+  pub(crate) evicted_object_count: AtomicU64,
+  pub(crate) evicted_bytes: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -54,4 +56,6 @@ impl BlobdMetrics {
 
   pub fn incomplete_object_count(&self) -> u64 { self.0.incomplete_object_count.load(Relaxed) }
   pub fn committed_object_count(&self) -> u64 { self.0.committed_object_count.load(Relaxed) }
+  pub fn evicted_object_count(&self) -> u64 { self.0.evicted_object_count.load(Relaxed) }
+  pub fn evicted_bytes(&self) -> u64 { self.0.evicted_bytes.load(Relaxed) }
 }

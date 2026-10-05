@@ -20,6 +20,7 @@ pub struct InitCfgPartition {
 
 pub struct InitCfg {
   pub bucket_count: u64,
+  pub cache_eviction: bool,
   pub do_not_format_device: bool,
   pub log_buffer_size: u64,
   pub lpage_size: u64,

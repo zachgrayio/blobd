@@ -69,11 +69,15 @@ pub(crate) async fn op_read_object(
   ctx: Arc<Ctx>,
   req: OpReadObjectInput,
 ) -> OpResult<OpReadObjectOutput> {
-  let Some(obj) = ctx
+  let Some((obj, pin)) = ctx
     .committed_objects
     .get(&req.key)
     .filter(|o| req.id.is_none() || Some(o.id()) == req.id)
-    .map(|e| e.value().clone())
+    .and_then(|entry| {
+      let pin = entry.try_pin()?;
+      entry.touch();
+      Some((entry.value().clone(), pin))
+    })
   else {
     return Err(OpError::ObjectNotFound);
   };
@@ -109,6 +113,7 @@ pub(crate) async fn op_read_object(
   }
 
   let data_stream = async_stream::try_stream! {
+    let _pin = pin;
     // This is the lpage index (incremented every lpage) or tail page index (incremented every tail page **which differ in size**).
     let mut idx = u32!(div_pow2(start, ctx.pages.lpage_size_pow2));
     if idx >= lpage_count {

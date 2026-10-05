@@ -34,6 +34,8 @@ use op::inspect_object::OpInspectObjectOutput;
 use op::read_object::op_read_object;
 use op::read_object::OpReadObjectInput;
 use op::read_object::OpReadObjectOutput;
+use op::touch_object::op_touch_object;
+use op::touch_object::OpTouchObjectInput;
 use op::write_object::op_write_object;
 use op::write_object::OpWriteObjectInput;
 use op::write_object::OpWriteObjectOutput;
@@ -56,6 +58,7 @@ use uring_file::uring::UringCfg;
 
 pub mod allocator;
 pub mod backing_store;
+mod clock;
 pub mod ctx;
 pub mod exporter;
 pub mod incomplete_token;
@@ -67,6 +70,9 @@ pub mod pages;
 pub mod partition;
 pub mod tuples;
 pub mod util;
+
+#[cfg(all(test, target_os = "linux"))]
+mod device_tests;
 
 #[derive(Clone, Debug)]
 pub struct BlobdCfgPartition {
@@ -88,6 +94,8 @@ pub enum BlobdCfgBackingStore {
 #[derive(Clone, Debug)]
 pub struct BlobdCfg {
   pub backing_store: BlobdCfgBackingStore,
+  /// Evict committed objects when this partition runs out of pages or tuple slots.
+  pub cache_eviction: bool,
   /// This must be much greater than zero.
   pub expire_incomplete_objects_after_secs: u64,
   pub lpage_size_pow2: u8,
@@ -236,6 +244,11 @@ pub struct BlobdListObjectsOutputObject {
 }
 
 impl Blobd {
+  pub async fn touch_object(&self, input: OpTouchObjectInput) -> OpResult<()> {
+    let partition_index = self.get_partition_index_by_object_key(&input.key);
+    op_touch_object(self.partitions[partition_index].ctx.clone(), input).await
+  }
+
   // Provide getter to prevent mutating BlobdCfg.
   pub fn cfg(&self) -> &BlobdCfg {
     &self.cfg

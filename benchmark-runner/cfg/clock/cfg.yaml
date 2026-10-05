@@ -1,0 +1,12 @@
+target: Direct
+partitions:
+  - path: /dev/loop0
+    offset: 0
+    len: 16777216
+lpage_size: 16384
+spage_size: 512
+read_size: 4096
+read_stream_buffer_size: 4096
+objects: 400
+object_size: 16384
+concurrency: 1
